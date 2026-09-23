@@ -10,6 +10,10 @@ Examples:
     scripts/run_tau2.py telecom --num-tasks 20 --num-trials 2
     TAU2_MODEL=qwen2.5:14b scripts/run_tau2.py retail --num-tasks 5
 
+Results are copied out of the tau2-bench submodule into results/<run-name>/
+in this repo after the run finishes, so they're stored alongside the rest of
+the project rather than buried in third-party code.
+
 Env overrides:
     TAU2_MODEL            Ollama model tag (default: qwen2.5:32b)
     TAU2_NUM_CTX           Context window passed to Ollama (default: 16384)
@@ -17,6 +21,8 @@ Env overrides:
                            serves one big model at a time, so keep this low
                            unless OLLAMA_NUM_PARALLEL is configured)
     OLLAMA_HOST            Ollama server base URL (default: http://localhost:11434)
+    TAU2_RESULTS_DIR       Where finished runs are copied to (default: results/
+                           at the repo root)
 """
 
 from __future__ import annotations
@@ -25,12 +31,14 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TAU2_DIR = os.path.join(SCRIPT_DIR, "..", "third_party", "tau2-bench")
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+TAU2_DIR = os.path.join(REPO_ROOT, "third_party", "tau2-bench")
 
 
 def ollama_models(ollama_host: str) -> list[str]:
@@ -127,7 +135,24 @@ def main() -> int:
         *passthrough,
     ]
 
-    return subprocess.call(cmd, cwd=TAU2_DIR)
+    returncode = subprocess.call(cmd, cwd=TAU2_DIR)
+
+    run_dir = os.path.join(TAU2_DIR, "data", "simulations", run_name)
+    if os.path.isfile(os.path.join(run_dir, "results.json")):
+        results_root = os.environ.get(
+            "TAU2_RESULTS_DIR", os.path.join(REPO_ROOT, "results")
+        )
+        dest_dir = os.path.join(results_root, run_name)
+        shutil.copytree(run_dir, dest_dir, dirs_exist_ok=True)
+        print(f"Results copied to: {dest_dir}")
+    else:
+        print(
+            f"No results.json found at {run_dir}; nothing copied "
+            "(run may have failed before producing output).",
+            file=sys.stderr,
+        )
+
+    return returncode
 
 
 if __name__ == "__main__":
