@@ -40,6 +40,28 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 TAU2_DIR = os.path.join(REPO_ROOT, "third_party", "tau2-bench")
 
+# tau2's NL-assertions grading judge has no CLI override and defaults to a
+# real OpenAI model (see patches/tau2_nl_assertions_local_judge.patch for
+# the full story). We patch the vendored config.py to point it at the local
+# Ollama model instead. Since third_party/tau2-bench is a submodule, that
+# edit lives only in this working copy and is wiped out by a fresh
+# `git submodule update`/re-clone, so we reapply it here if needed.
+NL_ASSERTIONS_PATCH = os.path.join(
+    REPO_ROOT, "patches", "tau2_nl_assertions_local_judge.patch"
+)
+NL_ASSERTIONS_PATCH_MARKER = "_TAU2_JUDGE_MODEL"
+
+
+def ensure_nl_assertions_patch() -> None:
+    config_path = os.path.join(TAU2_DIR, "src", "tau2", "config.py")
+    with open(config_path) as f:
+        if NL_ASSERTIONS_PATCH_MARKER in f.read():
+            return
+    print("Applying local patch: NL-assertions judge -> local Ollama model")
+    subprocess.check_call(
+        ["git", "apply", NL_ASSERTIONS_PATCH], cwd=TAU2_DIR
+    )
+
 
 def ollama_models(ollama_host: str) -> list[str]:
     with urllib.request.urlopen(f"{ollama_host}/api/tags", timeout=5) as resp:
@@ -108,6 +130,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    ensure_nl_assertions_patch()
 
     # NOTE: we deliberately use the "openai/" provider pointed at Ollama's
     # OpenAI-compatible endpoint (/v1) rather than litellm's native

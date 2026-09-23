@@ -1,0 +1,43 @@
+diff --git a/src/tau2/config.py b/src/tau2/config.py
+index c285d64..3f4a6c8 100644
+--- a/src/tau2/config.py
++++ b/src/tau2/config.py
+@@ -1,3 +1,5 @@
++import os
++
+ # =============================================================================
+ # SIMULATION DEFAULTS (overridable via CLI)
+ # =============================================================================
+@@ -21,9 +23,30 @@ DEFAULT_LLM_TEMPERATURE_USER = 0.0
+ DEFAULT_LLM_ARGS_AGENT = {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT}
+ DEFAULT_LLM_ARGS_USER = {"temperature": DEFAULT_LLM_TEMPERATURE_USER}
+ 
+-DEFAULT_LLM_NL_ASSERTIONS = "gpt-4.1-2025-04-14"
++# NOTE: this project's scripts/run_tau2.py runs everything against a local
++# Ollama model via LiteLLM's OpenAI-compatible endpoint (see its docstring
++# for why: LiteLLM's ollama_chat provider drops tool_calls from history).
++# The NL-assertions judge below has no CLI override in tau2's argparser, so
++# without this env-driven default it silently falls back to a real OpenAI
++# model and fails with AuthenticationError whenever OPENAI_API_KEY isn't
++# set (this is what caused ~1/3 of a 114-task retail run to fail with
++# "infrastructure_error" on 2026-09-22 — every task with nl_assertions in
++# its evaluation_criteria). Reading the same TAU2_MODEL/OLLAMA_HOST/
++# TAU2_NUM_CTX env vars that run_tau2.py sets keeps the judge in sync with
++# whatever agent/user model is configured, at the cost of the agent
++# partially self-grading on the NL-assertion subset of tasks.
++_TAU2_JUDGE_MODEL = os.environ.get("TAU2_MODEL", "qwen2.5:32b")
++_TAU2_JUDGE_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
++_TAU2_JUDGE_NUM_CTX = int(os.environ.get("TAU2_NUM_CTX", "16384"))
++
++DEFAULT_LLM_NL_ASSERTIONS = f"openai/{_TAU2_JUDGE_MODEL}"
+ DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE = 0.0
+-DEFAULT_LLM_NL_ASSERTIONS_ARGS = {"temperature": DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE}
++DEFAULT_LLM_NL_ASSERTIONS_ARGS = {
++    "temperature": DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE,
++    "api_base": f"{_TAU2_JUDGE_OLLAMA_HOST}/v1",
++    "api_key": "ollama",
++    "extra_body": {"options": {"num_ctx": _TAU2_JUDGE_NUM_CTX}},
++}
+ 
+ DEFAULT_LLM_ENV_INTERFACE = "gpt-4.1-2025-04-14"
+ DEFAULT_LLM_ENV_INTERFACE_TEMPERATURE = 0.0
