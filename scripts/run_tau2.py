@@ -47,6 +47,31 @@ def ollama_models(ollama_host: str) -> list[str]:
     return [m["name"] for m in data.get("models", [])]
 
 
+def split_per_task(results_path: str, domain: str, dest_dir: str) -> None:
+    """Split a tau2 results.json into one <domain>_<task_id>_clean.json per
+    task (all trials for that task included), each a self-contained
+    results.json-shaped file (same schema, scoped to that task)."""
+    with open(results_path) as f:
+        results = json.load(f)
+
+    tasks_by_id = {task["id"]: task for task in results["tasks"]}
+    sims_by_task: dict[str, list] = {}
+    for sim in results["simulations"]:
+        sims_by_task.setdefault(sim["task_id"], []).append(sim)
+
+    for task_id, sims in sims_by_task.items():
+        task_out = {
+            "timestamp": results.get("timestamp"),
+            "info": results.get("info"),
+            "tasks": [tasks_by_id[task_id]] if task_id in tasks_by_id else [],
+            "simulations": sims,
+            "simulation_index": None,
+        }
+        out_path = os.path.join(dest_dir, f"{domain}_{task_id}_clean.json")
+        with open(out_path, "w") as f:
+            json.dump(task_out, f, indent=2)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run a tau2-bench evaluation against a local Ollama model.",
@@ -144,7 +169,11 @@ def main() -> int:
         )
         dest_dir = os.path.join(results_root, run_name)
         shutil.copytree(run_dir, dest_dir, dirs_exist_ok=True)
+        split_per_task(
+            os.path.join(dest_dir, "results.json"), args.domain, dest_dir
+        )
         print(f"Results copied to: {dest_dir}")
+        print(f"Per-task files written as: {dest_dir}/{args.domain}_<task_id>_clean.json")
     else:
         print(
             f"No results.json found at {run_dir}; nothing copied "
