@@ -16,7 +16,8 @@ the project rather than buried in third-party code.
 
 Env overrides:
     TAU2_MODEL            Ollama model tag (default: qwen2.5:32b)
-    TAU2_NUM_CTX           Context window passed to Ollama (default: 16384)
+    TAU2_NUM_CTX           Context window in tokens (default: 32768), built into a
+                           derived Ollama model <model>-ctx<N> that the run uses
     TAU2_MAX_CONCURRENCY   Concurrent simulations (default: 1; local Ollama
                            serves one big model at a time, so keep this low
                            unless OLLAMA_NUM_PARALLEL is configured)
@@ -40,33 +41,56 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 TAU2_DIR = os.path.join(REPO_ROOT, "third_party", "tau2-bench")
 
-# tau2's NL-assertions grading judge has no CLI override and defaults to a
-# real OpenAI model (see patches/tau2_nl_assertions_local_judge.patch for
-# the full story). We patch the vendored config.py to point it at the local
-# Ollama model instead. Since third_party/tau2-bench is a submodule, that
-# edit lives only in this working copy and is wiped out by a fresh
-# `git submodule update`/re-clone, so we reapply it here if needed.
-NL_ASSERTIONS_PATCH = os.path.join(
-    REPO_ROOT, "patches", "tau2_nl_assertions_local_judge.patch"
-)
-NL_ASSERTIONS_PATCH_MARKER = "_TAU2_JUDGE_MODEL"
+# Local patches to the vendored tau2 (each .patch file explains why):
+#   - the NL-assertions grading judge has no CLI override and defaults to a
+#     real OpenAI model, so config.py points it at the local Ollama model;
+#   - Ollama mishandles Qwen2.5 tool calls (drops calls to tools not in the
+#     request, crashing the task), so llm_utils.py handles them client-side.
+# Since third_party/tau2-bench is a submodule, these edits live only in this
+# working copy and are wiped out by a fresh `git submodule update`/re-clone,
+# so we reapply them here if needed. Each entry: (patch, patched file, marker).
+PATCHES = [
+    ("tau2_nl_assertions_local_judge.patch", "src/tau2/config.py", "_TAU2_JUDGE_MODEL"),
+    (
+        "tau2_qwen_tools_in_prompt.patch",
+        "src/tau2/utils/llm_utils.py",
+        "TAU2_QWEN_TOOLS_IN_PROMPT",
+    ),
+]
 
 
-def ensure_nl_assertions_patch() -> None:
-    config_path = os.path.join(TAU2_DIR, "src", "tau2", "config.py")
-    with open(config_path) as f:
-        if NL_ASSERTIONS_PATCH_MARKER in f.read():
-            return
-    print("Applying local patch: NL-assertions judge -> local Ollama model")
-    subprocess.check_call(
-        ["git", "apply", NL_ASSERTIONS_PATCH], cwd=TAU2_DIR
-    )
+def ensure_patches() -> None:
+    for patch, target, marker in PATCHES:
+        with open(os.path.join(TAU2_DIR, target)) as f:
+            if marker in f.read():
+                continue
+        print(f"Applying local patch: {patch}")
+        subprocess.check_call(
+            ["git", "apply", os.path.join(REPO_ROOT, "patches", patch)], cwd=TAU2_DIR
+        )
 
 
 def ollama_models(ollama_host: str) -> list[str]:
     with urllib.request.urlopen(f"{ollama_host}/api/tags", timeout=5) as resp:
         data = json.load(resp)
     return [m["name"] for m in data.get("models", [])]
+
+
+def ensure_context_model(ollama_host: str, model: str, num_ctx: int) -> str:
+    """Create (or refresh) <model>-ctx<num_ctx>: the same weights with num_ctx built in."""
+    # Ollama's OpenAI-compatible endpoint ignores per-request num_ctx, so it must live in the model.
+    derived = f"{model}-ctx{num_ctx}"
+    body = {"model": derived, "from": model, "parameters": {"num_ctx": num_ctx}, "stream": False}
+    req = urllib.request.Request(
+        f"{ollama_host}/api/create",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        status = json.load(resp).get("status")
+    if status != "success":
+        raise RuntimeError(f"Ollama could not create {derived}: {status}")
+    return derived
 
 
 def split_per_task(results_path: str, domain: str, dest_dir: str) -> None:
@@ -103,7 +127,7 @@ def main() -> int:
     args, passthrough = parser.parse_known_args()
 
     model = os.environ.get("TAU2_MODEL", "qwen2.5:32b")
-    num_ctx = int(os.environ.get("TAU2_NUM_CTX", "16384"))
+    num_ctx = int(os.environ.get("TAU2_NUM_CTX", "32768"))
     max_concurrency = os.environ.get("TAU2_MAX_CONCURRENCY", "1")
     ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
@@ -131,7 +155,21 @@ def main() -> int:
         )
         return 1
 
-    ensure_nl_assertions_patch()
+    ensure_patches()
+    run_model = ensure_context_model(ollama_host, model, num_ctx)
+
+    env = dict(os.environ)
+    # The NL-assertions judge patch reads these, so the judge shares the same model and context.
+    env["TAU2_MODEL"] = run_model
+    env["TAU2_NUM_CTX"] = str(num_ctx)
+    if model.startswith("qwen2.5"):
+        env["TAU2_QWEN_TOOLS_IN_PROMPT"] = "1"
+        tool_mode = "client-side, Qwen2.5 chat template"
+    else:
+        tool_mode = (
+            "Ollama's parser (WARNING: calls to tools not in the request "
+            "come back empty and crash the task)"
+        )
 
     # NOTE: we deliberately use the "openai/" provider pointed at Ollama's
     # OpenAI-compatible endpoint (/v1) rather than litellm's native
@@ -146,7 +184,7 @@ def main() -> int:
         {
             "api_base": f"{ollama_host}/v1",
             "api_key": "ollama",
-            "extra_body": {"options": {"num_ctx": num_ctx}},
+            "temperature": 0.0,  # tau2's default; these args replace its defaults wholesale
         }
     )
 
@@ -157,8 +195,8 @@ def main() -> int:
     )
 
     print(
-        f"Domain: {args.domain} | Model: {model} (via {ollama_host}) | "
-        f"num_ctx: {num_ctx} | save-to: {run_name}"
+        f"Domain: {args.domain} | Model: {run_model} (via {ollama_host}) | "
+        f"context: {num_ctx} tokens | temperature: 0 | tools: {tool_mode} | save-to: {run_name}"
     )
 
     cmd = [
@@ -169,11 +207,11 @@ def main() -> int:
         "--domain",
         args.domain,
         "--agent-llm",
-        f"openai/{model}",
+        f"openai/{run_model}",
         "--agent-llm-args",
         llm_args,
         "--user-llm",
-        f"openai/{model}",
+        f"openai/{run_model}",
         "--user-llm-args",
         llm_args,
         "--max-concurrency",
@@ -184,7 +222,7 @@ def main() -> int:
         *passthrough,
     ]
 
-    returncode = subprocess.call(cmd, cwd=TAU2_DIR)
+    returncode = subprocess.call(cmd, cwd=TAU2_DIR, env=env)
 
     run_dir = os.path.join(TAU2_DIR, "data", "simulations", run_name)
     if os.path.isfile(os.path.join(run_dir, "results.json")):

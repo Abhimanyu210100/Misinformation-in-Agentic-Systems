@@ -1,0 +1,170 @@
+Qwen2.5 tool calling done client-side for local Ollama runs.
+
+Why: Ollama's OpenAI-compatible endpoint (seen on 0.33.1) mishandles tools for
+Qwen2.5 in two ways:
+  1. Its tool-call parser silently drops any call to a tool that isn't in the
+     request's tool list. The reply comes back with no text and no tool calls,
+     and tau2 aborts the whole task ("AssistantMessage/UserMessage must have
+     either content or tool_calls"). In telecom the agent and user have
+     different tools, so this crashed 21-43% of telecom tasks. Retries can't
+     help: with a fixed seed they replay the same conversation.
+  2. It renders tool schemas into the prompt as Go struct dumps
+     ({get_customer_by_phone Finds a ... {object <nil> <nil> [...] {...}}})
+     instead of JSON.
+
+What: when TAU2_QWEN_TOOLS_IN_PROMPT=1 (set by scripts/run_tau2.py for
+qwen2.5* models), generate() writes tools, tool calls and tool results as plain
+chat text exactly as Qwen2.5's official chat template renders them (checked
+character-for-character against the Hugging Face template), sends no `tools`
+field, and parses <tool_call> blocks out of the reply itself. A call to a tool
+the caller doesn't have now reaches tau2, which answers with its normal
+"Tool '...' not found." error and the conversation continues, as it would with
+a hosted API. A reply whose <tool_call> block isn't valid JSON is kept as plain
+text (as vLLM's hermes parser does) instead of crashing on json.loads.
+
+diff --git a/src/tau2/utils/llm_utils.py b/src/tau2/utils/llm_utils.py
+index cc70482..0972863 100644
+--- a/src/tau2/utils/llm_utils.py
++++ b/src/tau2/utils/llm_utils.py
+@@ -352,6 +352,96 @@ def _write_llm_log(
+         json.dump(call_data, f, indent=2)
+ 
+ 
++# Set by the parent repo's scripts/run_tau2.py; see its patches/tau2_qwen_tools_in_prompt.patch.
++QWEN_TOOLS_IN_PROMPT = os.environ.get("TAU2_QWEN_TOOLS_IN_PROMPT") == "1"
++_QWEN_DEFAULT_SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
++_QWEN_TOOLS_HEADER = (
++    "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
++    "You are provided with function signatures within <tools></tools> XML tags:\n<tools>"
++)
++_QWEN_TOOLS_FOOTER = (
++    "\n</tools>\n\nFor each function call, return a json object with function name and "
++    "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
++    '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>'
++)
++_QWEN_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)(?:</tool_call>|\Z)", re.DOTALL)
++
++
++def _uses_tools(litellm_messages: list[dict], tools_schema: Optional[list[dict]]) -> bool:
++    return bool(tools_schema) or any(
++        m["role"] == "tool" or m.get("tool_calls") for m in litellm_messages
++    )
++
++
++def to_qwen_text_messages(
++    litellm_messages: list[dict], tools_schema: Optional[list[dict]]
++) -> list[dict]:
++    """Write tools, tool calls and tool results as plain chat text, exactly as
++    Qwen2.5's chat template renders them, so no tool fields reach the server."""
++    messages = litellm_messages
++    if messages and messages[0]["role"] == "system":
++        system, messages = messages[0]["content"], messages[1:]
++    else:
++        system = _QWEN_DEFAULT_SYSTEM
++    if tools_schema:
++        system += (
++            _QWEN_TOOLS_HEADER
++            + "".join("\n" + json.dumps(t, ensure_ascii=False) for t in tools_schema)
++            + _QWEN_TOOLS_FOOTER
++        )
++    out = [{"role": "system", "content": system}]
++    previous_role = "system"
++    for m in messages:
++        if m["role"] == "tool":
++            block = "<tool_response>\n" + m["content"] + "\n</tool_response>"
++            if previous_role == "tool":
++                out[-1]["content"] += "\n" + block
++            else:
++                out.append({"role": "user", "content": block})
++        elif m["role"] == "assistant" and m.get("tool_calls"):
++            calls = "".join(
++                '\n<tool_call>\n{"name": "'
++                + tc["function"]["name"]
++                + '", "arguments": '
++                + json.dumps(json.loads(tc["function"]["arguments"]), ensure_ascii=False)
++                + "}\n</tool_call>"
++                for tc in m["tool_calls"]
++            )
++            content = m["content"] + calls if m.get("content") else calls[1:]
++            out.append({"role": "assistant", "content": content})
++        else:
++            out.append({"role": m["role"], "content": m["content"]})
++        previous_role = m["role"]
++    return out
++
++
++def parse_qwen_tool_calls(text: Optional[str]) -> tuple[Optional[str], list[ToolCall]]:
++    """Split a Qwen reply into text and <tool_call> blocks. A reply with any block
++    that isn't a valid {"name", "arguments"} object stays plain text, as in
++    vLLM's hermes parser."""
++    if not text or "<tool_call>" not in text:
++        return text, []
++    tool_calls = []
++    for block in _QWEN_TOOL_CALL_RE.findall(text):
++        try:
++            call = json.loads(block)
++            arguments = call.get("arguments") or {}
++            if isinstance(arguments, str):
++                arguments = json.loads(arguments)
++            if not isinstance(call["name"], str) or not isinstance(arguments, dict):
++                return text, []
++        except (ValueError, AttributeError, KeyError, TypeError):
++            return text, []
++        tool_calls.append(
++            ToolCall(
++                id=f"call_{uuid.uuid4().hex[:24]}",
++                name=call["name"],
++                arguments=arguments,
++            )
++        )
++    return _QWEN_TOOL_CALL_RE.sub("", text).strip() or None, tool_calls
++
++
+ def generate(
+     model: str,
+     messages: list[Message],
+@@ -389,6 +479,7 @@ def generate(
+     tools_schema = [tool.openai_schema for tool in tools] if tools else None
+     if tools_schema and tool_choice is None:
+         tool_choice = "auto"
++    qwen_tools = QWEN_TOOLS_IN_PROMPT and _uses_tools(litellm_messages, tools_schema)
+ 
+     # Prepare request data for logging
+     formatted_messages = _format_messages_for_logging(litellm_messages)
+@@ -406,13 +497,20 @@ def generate(
+ 
+     start_time = time.perf_counter()
+     try:
+-        response = completion(
+-            model=model,
+-            messages=litellm_messages,
+-            tools=tools_schema,
+-            tool_choice=tool_choice,
+-            **kwargs,
+-        )
++        if qwen_tools:
++            response = completion(
++                model=model,
++                messages=to_qwen_text_messages(litellm_messages, tools_schema),
++                **kwargs,
++            )
++        else:
++            response = completion(
++                model=model,
++                messages=litellm_messages,
++                tools=tools_schema,
++                tool_choice=tool_choice,
++                **kwargs,
++            )
+     except Exception as e:
+         logger.error(e)
+         raise e
+@@ -441,6 +539,8 @@ def generate(
+         )
+         for tool_call in raw_tool_calls
+     ]
++    if qwen_tools:
++        content, tool_calls = parse_qwen_tool_calls(content)
+     tool_calls = tool_calls or None
+ 
+     message = AssistantMessage(
