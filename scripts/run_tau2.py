@@ -7,6 +7,7 @@ Usage:
 
 Examples:
     scripts/run_tau2.py retail
+    scripts/run_tau2.py airline_misinfo_user   # a condition from scripts/tau2_cli.py
     scripts/run_tau2.py telecom --num-tasks 20 --num-trials 2
     TAU2_MODEL=qwen2.5:14b scripts/run_tau2.py retail --num-tasks 5
 
@@ -32,6 +33,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +45,11 @@ TAU2_DIR = os.path.join(REPO_ROOT, "third_party", "tau2-bench")
 
 # Local patches to the vendored tau2 (each .patch file explains why):
 #   - the NL-assertions grading judge has no CLI override and defaults to a
-#     real OpenAI model, so config.py points it at the local Ollama model;
+#     real OpenAI model, so config.py points it at the local Ollama model
+#     (and asks Ollama for JSON-constrained output);
+#   - tau2 json.loads() the judge's raw reply, so fenced/prose/trailing-comma
+#     replies crashed tasks as infrastructure_error; evaluator_nl_assertions.py
+#     parses them tolerantly and shows the raw reply if it still can't;
 #   - Ollama mishandles Qwen2.5 tool calls (drops calls to tools not in the
 #     request, crashing the task), so llm_utils.py handles them client-side.
 # Since third_party/tau2-bench is a submodule, these edits live only in this
@@ -51,6 +57,11 @@ TAU2_DIR = os.path.join(REPO_ROOT, "third_party", "tau2-bench")
 # so we reapply them here if needed. Each entry: (patch, patched file, marker).
 PATCHES = [
     ("tau2_nl_assertions_local_judge.patch", "src/tau2/config.py", "_TAU2_JUDGE_MODEL"),
+    (
+        "tau2_nl_assertions_json_parse.patch",
+        "src/tau2/evaluator/evaluator_nl_assertions.py",
+        "TAU2_JUDGE_JSON_PARSE",
+    ),
     (
         "tau2_qwen_tools_in_prompt.patch",
         "src/tau2/utils/llm_utils.py",
@@ -94,9 +105,13 @@ def ensure_context_model(ollama_host: str, model: str, num_ctx: int) -> str:
 
 
 def split_per_task(results_path: str, domain: str, dest_dir: str) -> None:
-    """Split a tau2 results.json into one <domain>_<task_id>_clean.json per
-    task (all trials for that task included), each a self-contained
-    results.json-shaped file (same schema, scoped to that task)."""
+    """Split a tau2 results.json into one <domain>_<task_id>_<condition>.json
+    per task (all trials for that task included), each a self-contained
+    results.json-shaped file (same schema, scoped to that task). The condition
+    is "clean" for a base domain, or e.g. "misinfo_user" for the condition
+    domains registered by tau2_cli.py (airline_misinfo_user -> airline_19_misinfo_user.json)."""
+    match = re.fullmatch(r"(.+)_((?:misinfo|true)_(?:user|tool))", domain)
+    domain, condition = (match.group(1), match.group(2)) if match else (domain, "clean")
     with open(results_path) as f:
         results = json.load(f)
 
@@ -113,7 +128,7 @@ def split_per_task(results_path: str, domain: str, dest_dir: str) -> None:
             "simulations": sims,
             "simulation_index": None,
         }
-        out_path = os.path.join(dest_dir, f"{domain}_{task_id}_clean.json")
+        out_path = os.path.join(dest_dir, f"{domain}_{task_id}_{condition}.json")
         with open(out_path, "w") as f:
             json.dump(task_out, f, indent=2)
 
@@ -123,7 +138,11 @@ def main() -> int:
         description="Run a tau2-bench evaluation against a local Ollama model.",
         epilog="Unrecognized flags are passed through to 'tau2 run' (e.g. --num-tasks, --num-trials).",
     )
-    parser.add_argument("domain", help="retail | telecom | airline | mock")
+    parser.add_argument(
+        "domain",
+        help="retail | telecom | airline | mock | banking_knowledge, or a misinformation "
+        "condition such as airline_misinfo_user (see scripts/tau2_cli.py)",
+    )
     args, passthrough = parser.parse_known_args()
 
     model = os.environ.get("TAU2_MODEL", "qwen2.5:32b")
@@ -199,10 +218,12 @@ def main() -> int:
         f"context: {num_ctx} tokens | temperature: 0 | tools: {tool_mode} | save-to: {run_name}"
     )
 
+    # tau2_cli.py is tau2's CLI plus our misinformation-condition domains.
     cmd = [
         "uv",
         "run",
-        "tau2",
+        "python",
+        os.path.join(SCRIPT_DIR, "tau2_cli.py"),
         "run",
         "--domain",
         args.domain,
@@ -235,7 +256,7 @@ def main() -> int:
             os.path.join(dest_dir, "results.json"), args.domain, dest_dir
         )
         print(f"Results copied to: {dest_dir}")
-        print(f"Per-task files written as: {dest_dir}/{args.domain}_<task_id>_clean.json")
+        print(f"Per-task files written to: {dest_dir}")
     else:
         print(
             f"No results.json found at {run_dir}; nothing copied "

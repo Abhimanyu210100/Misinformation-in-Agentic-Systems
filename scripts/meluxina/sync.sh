@@ -2,7 +2,7 @@
 # Copy this repo between the laptop and MeluXina. Run on the laptop.
 #
 #   scripts/meluxina/sync.sh push   # laptop -> MeluXina (code + patched tau2 submodule)
-#   scripts/meluxina/sync.sh pull   # MeluXina -> laptop (results/ only)
+#   scripts/meluxina/sync.sh pull   # MeluXina -> laptop (results/ and misinfo/)
 #
 # rsync rather than git clone, because the tau2 patches and run_tau2.py edits
 # aren't necessarily committed/pushed, and the patched submodule state should
@@ -19,13 +19,16 @@ case "${1:-}" in
     # .venv holds macOS binaries; the cluster builds its own (setup.sh).
     rsync -az --progress \
       --exclude '.venv/' --exclude '__pycache__/' --exclude '.DS_Store' \
-      --exclude '/results/' --exclude '/results_archive/' --exclude '/logs/' \
+      --exclude '/results/' --exclude '/results_archive/' --exclude '/results_clean_mexlunia/' --exclude '/logs/' \
       --exclude '/third_party/tau2-bench/data/simulations/' \
       "$LOCAL_REPO/" "$REMOTE_HOST:$REMOTE_REPO/"
     ;;
   pull)
-    mkdir -p "$LOCAL_REPO/results"
+    mkdir -p "$LOCAL_REPO/results" "$LOCAL_REPO/misinfo"
     rsync -az --progress "$REMOTE_HOST:$REMOTE_REPO/results/" "$LOCAL_REPO/results/"
+    # Generated misinformation (misinfo.sbatch). push also sends misinfo/, so
+    # pull before pushing, or a stale laptop copy overwrites the cluster's.
+    rsync -az --progress "$REMOTE_HOST:$REMOTE_REPO/misinfo/" "$LOCAL_REPO/misinfo/"
     ;;
   *)
     echo "usage: $0 push|pull" >&2

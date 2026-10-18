@@ -9,12 +9,15 @@
 #   - Ollama 0.33.1, the same version as the laptop runs (no root needed: it's
 #     a self-contained tarball with its own CUDA libs);
 #   - uv, and tau2's Python env (with the `knowledge` extra for banking_knowledge);
-#   - the model weights (qwen2.5:72b = Qwen2.5-72B-Instruct, pinned).
+#   - the model weights: qwen2.5:72b (Qwen2.5-72B-Instruct, the agent), plus
+#     llama3.3:70b and gpt-oss:120b (misinformation generator and judge, see
+#     misinfo.sbatch). All pinned.
 # Safe to re-run: every step is skipped if already done.
 set -euo pipefail
 
 OLLAMA_VERSION=0.33.1
 MODEL=qwen2.5:72b  # pinned: ignores any TAU2_MODEL in the environment
+MISINFO_MODELS=(llama3.3:70b gpt-oss:120b)  # generator, judge
 WORK=/project/home/p201155/$USER
 REPO="$WORK/Misinformation-in-Agentic-Systems"
 OLLAMA_DIR="$WORK/ollama-$OLLAMA_VERSION"
@@ -79,6 +82,10 @@ for _ in $(seq 60); do
 done
 echo "Pulling $MODEL (about 47 GB for qwen2.5:72b)..."
 "$OLLAMA_DIR/bin/ollama" pull "$MODEL"
+echo "Pulling ${MISINFO_MODELS[*]} (about 43 GB + 65 GB)..."
+for m in "${MISINFO_MODELS[@]}"; do
+  "$OLLAMA_DIR/bin/ollama" pull "$m"
+done
 "$OLLAMA_DIR/bin/ollama" list
 
 echo
